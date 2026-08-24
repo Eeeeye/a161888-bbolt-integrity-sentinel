@@ -1,0 +1,101 @@
+diff --git a/internal/surgeon/xray.go b/internal/surgeon/xray.go
+--- a/internal/surgeon/xray.go
++++ b/internal/surgeon/xray.go
+@@ -23,6 +23,10 @@ type XRay struct {
+ 
+ func (n XRay) traverse(stack []common.Pgid, visited map[common.Pgid]struct{}, callback func(page *common.Page, stack []common.Pgid) error) error {
+ 	pgid := stack[len(stack)-1]
++	if _, ok := visited[pgid]; ok {
++		return fmt.Errorf("cycle detected at page %d (stack %v)", pgid, stack)
++	}
++	visited[pgid] = struct{}{}
+ 
+ 	p, data, err := guts_cli.ReadPage(n.path, uint64(pgid))
+ 	if err != nil {
+diff --git a/tx_check.go b/tx_check.go
+--- a/tx_check.go
++++ b/tx_check.go
+@@ -36,6 +36,11 @@ func (tx *Tx) Check(options ...CheckOption) <-chan error {
+ }
+ 
+ func (tx *Tx) check(cfg checkConfig, ch chan error) {
++	defer func() {
++		if r := recover(); r != nil {
++			ch <- panicked{r}
++		}
++	}()
+ 	// Force loading free list if opened in ReadOnly mode.
+ 	tx.db.loadFreelist()
+ 
+diff --git a/bucket.go b/bucket.go
+--- a/bucket.go
++++ b/bucket.go
+@@ -663,15 +663,17 @@ func (b *Bucket) Stats() BucketStats {
+ 			s.BranchPageN++
+ 
+ 			used := common.PageHeaderSize
+-			lastElement := p.BranchPageElement(p.Count() - 1)
++			if p.Count() != 0 {
++				lastElement := p.BranchPageElement(p.Count() - 1)
+ 
+-			// Add all element headers.
+-			used += common.BranchPageElementSize * uintptr(p.Count()-1)
++				// Add all element headers.
++				used += common.BranchPageElementSize * uintptr(p.Count()-1)
+ 
+-			// Add size of all keys and values.
+-			// Again, use the fact that last element's position equals to
+-			// the total of key, value sizes of all previous elements.
+-			used += uintptr(lastElement.Pos() + lastElement.Ksize())
++				// Add size of all keys and values.
++				// Again, use the fact that last element's position equals to
++				// the total of key, value sizes of all previous elements.
++				used += uintptr(lastElement.Pos() + lastElement.Ksize())
++			}
+ 
+ 			s.BranchInuse += int(used)
+ 			s.BranchOverflowN += int(p.Overflow())
+diff --git a/tx.go b/tx.go
+--- a/tx.go
++++ b/tx.go
+@@ -319,13 +319,25 @@ func (tx *Tx) nonPhysicalRollback() {
+ 	tx.close()
+ }
+ 
+-// rollback releases allocations from a failed writable transaction.
++// rollback needs to reload the free pages from disk in case some system error happens like fsync error.
+ func (tx *Tx) rollback() {
+ 	if tx.db == nil {
+ 		return
+ 	}
+ 	if tx.writable {
+ 		tx.db.freelist.Rollback(tx.meta.Txid())
++		// When mmap fails, the `data`, `dataref` and `datasz` may be reset to
++		// zero values, and there is no way to reload free page IDs in this case.
++		if tx.db.data != nil {
++			if !tx.db.hasSyncedFreelist() {
++				// Reconstruct free page list by scanning the DB to get the whole free page list.
++				// Note: scanning the whole db is heavy if your db size is large in NoSyncFreeList mode.
++				tx.db.freelist.NoSyncReload(tx.db.freepages())
++			} else {
++				// Read free page list from freelist page.
++				tx.db.freelist.Reload(tx.db.page(tx.db.meta().Freelist()))
++			}
++		}
+ 	}
+ 	tx.close()
+ }
+@@ -591,10 +603,13 @@ func (tx *Tx) writeMeta() error {
+ 	tx.meta.Write(p)
+ 
+ 	// Write the meta page to file.
++	tx.db.metalock.Lock()
+ 	if _, err := tx.db.ops.writeAt(buf, int64(p.Id())*int64(tx.db.pageSize)); err != nil {
++		tx.db.metalock.Unlock()
+ 		lg.Errorf("writeAt failed, pgid: %d, pageSize: %d, error: %v", p.Id(), tx.db.pageSize, err)
+ 		return err
+ 	}
++	tx.db.metalock.Unlock()
+ 	if !tx.db.NoSync || common.IgnoreNoSync {
+ 		// gofail: var beforeSyncMetaPage struct{}
+ 		if err := fdatasync(tx.db); err != nil {

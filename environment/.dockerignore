@@ -1,0 +1,5 @@
+bbolt/.git
+bbolt/.github
+bbolt/bin
+bbolt/dist
+**/.DS_Store

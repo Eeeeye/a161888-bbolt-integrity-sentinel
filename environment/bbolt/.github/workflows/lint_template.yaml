@@ -1,0 +1,26 @@
+---
+name: Reusable lint Workflow
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+permissions: read-all
+
+jobs:
+  lint:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: goversion
+        run: echo "goversion=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.goversion.outputs.goversion }}
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.10.1
