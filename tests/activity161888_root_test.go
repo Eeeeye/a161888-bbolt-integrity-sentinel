@@ -104,6 +104,27 @@ func activity161888EqualPgids(a, b []common.Pgid) bool {
 	return true
 }
 
+func TestActivity161888CheckPreservesValidDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "valid-check.db")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	activity161888Fill(t, db, []byte("records"), 500, 100)
+	activity161888Fill(t, db, []byte("archive"), 40, 40)
+
+	err := db.View(func(tx *Tx) error {
+		var diagnostics []string
+		for checkErr := range tx.Check() {
+			diagnostics = append(diagnostics, checkErr.Error())
+		}
+		if len(diagnostics) != 0 {
+			return fmt.Errorf("valid database produced diagnostics: %v", diagnostics)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("check valid database: %v", err)
+	}
+}
+
 func TestActivity161888CheckContainsMalformedPagePanic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "check.db")
 	bucket := []byte("records")
@@ -147,6 +168,69 @@ func TestActivity161888CheckContainsMalformedPagePanic(t *testing.T) {
 	}
 	if text := diagnostic.String(); !strings.Contains(text, "flags: 0") && !strings.Contains(text, "unexpected type/flags: 0") {
 		t.Fatalf("Tx.Check diagnostic lost the malformed flags: %q", text)
+	}
+}
+
+func TestActivity161888CheckPreservesKeyOrderDiagnostics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key-order.db")
+	bucket := []byte("records")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	activity161888Fill(t, db, bucket, 500, 100)
+	root := activity161888RootPage(t, db, bucket)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close before key corruption: %v", err)
+	}
+
+	pageID := root
+	for {
+		p, buf, err := guts_cli.ReadPage(path, uint64(pageID))
+		if err != nil {
+			t.Fatalf("read page %d while locating leaf: %v", pageID, err)
+		}
+		switch {
+		case p.IsBranchPage():
+			if p.Count() == 0 {
+				t.Fatalf("branch page %d has no children", pageID)
+			}
+			pageID = p.BranchPageElement(0).Pgid()
+		case p.IsLeafPage():
+			if p.Count() < 2 {
+				t.Fatalf("leaf page %d has %d elements, want at least 2", pageID, p.Count())
+			}
+			secondKey := p.LeafPageElement(1).Key()
+			if len(secondKey) == 0 {
+				t.Fatalf("leaf page %d has an empty second key", pageID)
+			}
+			secondKey[0] = 0
+			if err := guts_cli.WritePage(path, buf); err != nil {
+				t.Fatalf("write out-of-order leaf page %d: %v", pageID, err)
+			}
+			goto corrupted
+		default:
+			t.Fatalf("page %d is %s while locating a leaf", pageID, p.Typ())
+		}
+	}
+
+corrupted:
+	db = activity161888Open(t, path, &Options{PageSize: 4096})
+	var diagnostics []string
+	err := db.View(func(tx *Tx) error {
+		for checkErr := range tx.Check() {
+			diagnostics = append(diagnostics, checkErr.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view database with out-of-order key: %v", err)
+	}
+	if len(diagnostics) == 0 {
+		t.Fatal("Tx.Check returned no key-order diagnostic")
+	}
+	joined := strings.Join(diagnostics, "\n")
+	if !strings.Contains(joined, "needs to be >") ||
+		!strings.Contains(joined, "previous element") ||
+		!strings.Contains(joined, "Stack") {
+		t.Fatalf("Tx.Check lost the key-order diagnostic context: %q", joined)
 	}
 }
 
@@ -279,6 +363,131 @@ func TestActivity161888RollbackReloadsFreelist(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("post-recovery consistency: %v", err)
+	}
+}
+
+func TestActivity161888RollbackPreservesNoFreelistSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollback-no-freelist-sync.db")
+	bucket := []byte("records")
+	options := &Options{PageSize: 4096, NoFreelistSync: true}
+	db := activity161888Open(t, path, options)
+
+	keys := make([][]byte, 11)
+	err := db.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket(bucket)
+		if err != nil {
+			return err
+		}
+		for i := range keys {
+			keys[i] = []byte(fmt.Sprintf("nfs_k%02d", i))
+			if err := b.Put(keys[i], bytes.Repeat([]byte{byte(i + 1)}, 1500)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("populate no-freelist-sync fixture: %v", err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		b := tx.Bucket(bucket)
+		for i := 0; i < 6; i++ {
+			if err := b.Delete(keys[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("create no-freelist-sync free pages: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close no-freelist-sync fixture: %v", err)
+	}
+	db = activity161888Open(t, path, options)
+	if got := len(activity161888FreelistInMemory(db)); got == 0 {
+		t.Fatal("no-freelist-sync fixture reconstructed no free pages")
+	}
+	meta, _, err := guts_cli.GetActiveMetaPage(path)
+	if err != nil {
+		t.Fatalf("read no-freelist-sync meta page: %v", err)
+	}
+	if meta.Freelist() != common.PgidNoFreelist {
+		t.Fatalf("freelist page=%d, want no-freelist marker %d", meta.Freelist(), common.PgidNoFreelist)
+	}
+
+	originalWriteAt := db.ops.writeAt
+	injected := errors.New("activity161888: injected no-freelist meta publication failure")
+	db.ops.writeAt = func(data []byte, offset int64) (int, error) {
+		if offset == 0 || offset == int64(db.pageSize) {
+			return 0, injected
+		}
+		return originalWriteAt(data, offset)
+	}
+	err = db.Update(func(tx *Tx) error {
+		b := tx.Bucket(bucket)
+		for i := 0; i < 8; i++ {
+			key := []byte(fmt.Sprintf("failed-write-%02d", i))
+			if err := b.Put(key, bytes.Repeat([]byte{byte(220 + i)}, 1800)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	db.ops.writeAt = originalWriteAt
+	if !errors.Is(err, injected) {
+		t.Fatalf("failed no-freelist-sync commit returned %v, want injected error", err)
+	}
+	authoritative := db.freepages()
+	sort.Slice(authoritative, func(i, j int) bool { return authoritative[i] < authoritative[j] })
+	afterMemory := activity161888FreelistInMemory(db)
+	if len(authoritative) == 0 {
+		t.Fatal("committed page graph reconstructed no free pages after failed transaction")
+	}
+	if !activity161888EqualPgids(authoritative, afterMemory) {
+		t.Fatalf("no-freelist-sync rollback did not restore committed free pages: graph=%v memory=%v", authoritative, afterMemory)
+	}
+
+	err = db.View(func(tx *Tx) error {
+		b := tx.Bucket(bucket)
+		for i := 0; i < 8; i++ {
+			if got := b.Get([]byte(fmt.Sprintf("failed-write-%02d", i))); got != nil {
+				return fmt.Errorf("failed transaction published key %d: %q", i, got)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("committed view after no-freelist-sync failure: %v", err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		return tx.Bucket(bucket).Put([]byte("recovery-write"), []byte("ok"))
+	})
+	if err != nil {
+		t.Fatalf("next no-freelist-sync write after failed commit: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close recovered no-freelist-sync database: %v", err)
+	}
+
+	db = activity161888Open(t, path, options)
+	err = db.View(func(tx *Tx) error {
+		b := tx.Bucket(bucket)
+		if got := b.Get([]byte("recovery-write")); !bytes.Equal(got, []byte("ok")) {
+			return fmt.Errorf("recovery write value=%q", got)
+		}
+		for i := 0; i < 8; i++ {
+			if got := b.Get([]byte(fmt.Sprintf("failed-write-%02d", i))); got != nil {
+				return fmt.Errorf("reopened database contains failed key %d: %q", i, got)
+			}
+		}
+		for checkErr := range tx.Check() {
+			return checkErr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reopened no-freelist-sync consistency: %v", err)
 	}
 }
 
