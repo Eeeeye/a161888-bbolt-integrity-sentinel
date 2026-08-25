@@ -4,12 +4,9 @@ WORKDIR /app
 
 ENV GOTOOLCHAIN=local
 
-COPY bbolt/go.mod bbolt/go.sum ./
-RUN go mod download
-
 COPY bbolt/ /app/
 RUN mkdir -p /logs/verifier \
-    && go build ./...
+    && go build . ./internal/surgeon
 
 ENV GOPROXY=off
 ENV GOSUMDB=off
