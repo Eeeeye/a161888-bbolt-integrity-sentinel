@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -66,7 +67,7 @@ func TestActivity161888CursorLastPreservesEmptyBucket(t *testing.T) {
 	}
 }
 
-func TestActivity161888WriteToUsesTransactionFileSnapshot(t *testing.T) {
+func TestActivity161888CopyFileUsesTransactionFileSnapshot(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("atomic path replacement fixture requires Linux rename semantics")
 	}
@@ -132,6 +133,89 @@ func TestActivity161888WriteToUsesTransactionFileSnapshot(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("validate copied snapshot: %v", err)
+	}
+}
+
+func TestActivity161888WriteToWithNonzeroWriteFlagUsesTransactionFileSnapshot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("atomic path replacement fixture requires Linux rename semantics")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "write-flag-primary.db")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	activity161888Fill(t, db, []byte("records"), 900, 256)
+	rtx, err := db.Begin(false)
+	if err != nil {
+		t.Fatalf("begin flagged snapshot: %v", err)
+	}
+	rtx.WriteFlag = syscall.O_CLOEXEC
+	wantSize := rtx.Size()
+
+	replacementPath := filepath.Join(dir, "write-flag-replacement.db")
+	replacement, err := Open(replacementPath, 0o600, &Options{PageSize: 4096})
+	if err != nil {
+		_ = rtx.Rollback()
+		t.Fatalf("open flagged replacement: %v", err)
+	}
+	if err := replacement.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket([]byte("replacement"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("different"), []byte("inode"))
+	}); err != nil {
+		_ = rtx.Rollback()
+		t.Fatalf("populate flagged replacement: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		_ = rtx.Rollback()
+		t.Fatalf("close flagged replacement: %v", err)
+	}
+	if err := os.Rename(replacementPath, path); err != nil {
+		_ = rtx.Rollback()
+		t.Fatalf("replace flagged database path: %v", err)
+	}
+
+	var snapshot bytes.Buffer
+	written, writeErr := rtx.WriteTo(&snapshot)
+	rollbackErr := rtx.Rollback()
+	if writeErr != nil {
+		t.Fatalf("WriteTo with nonzero WriteFlag after path replacement: %v", writeErr)
+	}
+	if rollbackErr != nil {
+		t.Fatalf("close flagged source snapshot: %v", rollbackErr)
+	}
+	if written != wantSize || int64(snapshot.Len()) != wantSize {
+		t.Fatalf("flagged snapshot size written=%d buffer=%d want=%d", written, snapshot.Len(), wantSize)
+	}
+
+	backupPath := filepath.Join(dir, "write-flag-snapshot.db")
+	if err := os.WriteFile(backupPath, snapshot.Bytes(), 0o600); err != nil {
+		t.Fatalf("persist flagged snapshot: %v", err)
+	}
+	backup, err := Open(backupPath, 0o600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open flagged snapshot: %v", err)
+	}
+	defer backup.Close()
+	if err := backup.View(func(tx *Tx) error {
+		b := tx.Bucket([]byte("records"))
+		if b == nil {
+			return fmt.Errorf("flagged snapshot lost original bucket")
+		}
+		if got := b.Get([]byte("00000899")); len(got) != 256 {
+			return fmt.Errorf("flagged snapshot value length=%d, want 256", len(got))
+		}
+		if tx.Bucket([]byte("replacement")) != nil {
+			return fmt.Errorf("nonzero WriteFlag switched to replacement inode")
+		}
+		for checkErr := range tx.Check() {
+			return checkErr
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("validate flagged snapshot: %v", err)
 	}
 }
 
