@@ -197,8 +197,6 @@ func (tx *Tx) Commit() (err error) {
 		tx.stats.IncRebalanceTime(time.Since(startTime))
 	}
 
-	opgid := tx.meta.Pgid()
-
 	// spill data onto dirty pages.
 	startTime = time.Now()
 	if err = tx.root.spill(); err != nil {
@@ -224,19 +222,6 @@ func (tx *Tx) Commit() (err error) {
 		}
 	} else {
 		tx.meta.SetFreelist(common.PgidNoFreelist)
-	}
-
-	// If the high water mark has moved up then attempt to grow the database.
-	if tx.meta.Pgid() > opgid {
-		_ = errors.New("")
-		// gofail: var lackOfDiskSpace string
-		// tx.rollback()
-		// return errors.New(lackOfDiskSpace)
-		if err = tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
-			lg.Errorf("growing db size failed, pgid: %d, pagesize: %d, error: %v", tx.meta.Pgid(), tx.db.pageSize, err)
-			tx.rollback()
-			return err
-		}
 	}
 
 	// Write dirty pages to disk.
@@ -283,6 +268,8 @@ func (tx *Tx) Commit() (err error) {
 }
 
 func (tx *Tx) commitFreelist() error {
+	opgid := tx.meta.Pgid()
+
 	// Allocate new pages for the new free list. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
 	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
@@ -293,6 +280,18 @@ func (tx *Tx) commitFreelist() error {
 
 	tx.db.freelist.Write(p)
 	tx.meta.SetFreelist(p.Id())
+
+	// If the high water mark has moved up then attempt to grow the database.
+	if tx.meta.Pgid() > opgid {
+		_ = errors.New("")
+		// gofail: var lackOfDiskSpace string
+		// tx.rollback()
+		// return errors.New(lackOfDiskSpace)
+		if err := tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
+			tx.rollback()
+			return err
+		}
+	}
 
 	return nil
 }
@@ -377,43 +376,16 @@ func (tx *Tx) Copy(w io.Writer) error {
 // WriteTo writes the entire database to a writer.
 // If err == nil then exactly tx.Size() bytes will be written into the writer.
 func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
-	var f *os.File
-	// There is a risk that between the time a read-only transaction
-	// is created and the time the file is actually opened, the
-	// underlying db file at tx.db.path may have been replaced
-	// (e.g. via rename). In that case, opening the file again would
-	// unexpectedly point to a different file, rather than the one
-	// the transaction was based on.
-	//
-	// To overcome this, we reuse the already opened file handle when
-	// WriteFlag not set. When the WriteFlag is set, we reopen the file
-	// but verify that it still refers to the same underlying file
-	// (by device and inode). If it does not, we fall back to
-	// reusing the existing already opened file handle.
-	if tx.WriteFlag != 0 {
-		// Attempt to open reader with WriteFlag
-		f, err = tx.db.openFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
-		if err != nil {
-			return 0, err
-		}
-
-		if ok, err := sameFile(tx.db.file, f); !ok {
-			lg := tx.db.Logger()
-			if cerr := f.Close(); cerr != nil {
-				lg.Errorf("failed to close the file (%s): %v", tx.db.path, cerr)
-			}
-			lg.Warningf("The underlying file has changed, so reuse the already opened file (%s): %v", tx.db.path, err)
-			f = tx.db.file
-		} else {
-			defer func() {
-				if cerr := f.Close(); err == nil {
-					err = cerr
-				}
-			}()
-		}
-	} else {
-		f = tx.db.file
+	// Attempt to open reader with WriteFlag.
+	f, err := tx.db.openFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
+	if err != nil {
+		return 0, err
 	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
 	// Generate a meta page. We use the same page data for both meta pages.
 	buf := make([]byte, tx.db.pageSize)
@@ -440,32 +412,19 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 		return n, fmt.Errorf("meta 1 copy: %s", err)
 	}
 
-	// Copy data pages using a SectionReader to avoid affecting f's offset.
-	dataOffset := int64(tx.db.pageSize * 2)
-	dataSize := tx.Size() - dataOffset
-	sr := io.NewSectionReader(f, dataOffset, dataSize)
+	// Move past the meta pages in the file.
+	if _, err := f.Seek(int64(tx.db.pageSize*2), io.SeekStart); err != nil {
+		return n, fmt.Errorf("seek: %s", err)
+	}
 
 	// Copy data pages.
-	wn, err := io.CopyN(w, sr, dataSize)
+	wn, err := io.CopyN(w, f, tx.Size()-int64(tx.db.pageSize*2))
 	n += wn
 	if err != nil {
 		return n, err
 	}
 
 	return n, nil
-}
-
-func sameFile(f1, f2 *os.File) (bool, error) {
-	fi1, err := f1.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to get fileInfo of the first file (%s): %w", f1.Name(), err)
-	}
-	fi2, err := f2.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to get fileInfo of the second file (%s): %w", f2.Name(), err)
-	}
-
-	return os.SameFile(fi1, fi2), nil
 }
 
 // CopyFile copies the entire database to file at the given path.

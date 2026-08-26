@@ -539,14 +539,12 @@ func (db *DB) mmap(minsz int) (err error) {
 	db.meta0 = db.page(0).Meta()
 	db.meta1 = db.page(1).Meta()
 
-	// Validate the meta pages. We only return an error if both meta pages fail
-	// validation, since meta0 failing validation means that it wasn't saved
-	// properly -- but we can recover using meta1. And vice-versa.
-	err0 := db.meta0.Validate()
-	err1 := db.meta1.Validate()
-	if err0 != nil && err1 != nil {
-		lg.Errorf("both meta pages are invalid, meta0: %v, meta1: %v", err0, err1)
-		return err0
+	// Validate both meta pages.
+	if err := db.meta0.Validate(); err != nil {
+		return err
+	}
+	if err := db.meta1.Validate(); err != nil {
+		return err
 	}
 
 	return nil
@@ -1139,26 +1137,10 @@ func (db *DB) pageInBuffer(b []byte, id common.Pgid) *common.Page {
 
 // meta retrieves the current meta page reference.
 func (db *DB) meta() *common.Meta {
-	// We have to return the meta with the highest txid which doesn't fail
-	// validation. Otherwise, we can cause errors when in fact the database is
-	// in a consistent state. metaA is the one with the higher txid.
-	metaA := db.meta0
-	metaB := db.meta1
-	if db.meta1.Txid() > db.meta0.Txid() {
-		metaA = db.meta1
-		metaB = db.meta0
+	if db.meta0.Txid() > db.meta1.Txid() {
+		return db.meta0
 	}
-
-	// Use higher meta page if valid. Otherwise, fallback to previous, if valid.
-	if err := metaA.Validate(); err == nil {
-		return metaA
-	} else if err := metaB.Validate(); err == nil {
-		return metaB
-	}
-
-	// This should never be reached, because both meta1 and meta0 were validated
-	// on mmap() and we do fsync() on every write.
-	panic("bolt.DB.meta(): invalid meta pages")
+	return db.meta1
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
@@ -1263,7 +1245,7 @@ func (db *DB) grow(sz int) error {
 func (db *DB) growSize(mmapSize, growSize int) int {
 	// If the data is smaller than the alloc size then only allocate what's needed.
 	// Once it goes over the allocation size then allocate in chunks.
-	if mmapSize <= db.AllocSize {
+	if mmapSize < db.AllocSize {
 		return mmapSize
 	} else {
 		return growSize + db.AllocSize

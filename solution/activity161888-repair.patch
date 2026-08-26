@@ -99,3 +99,247 @@ diff --git a/tx.go b/tx.go
  	if !tx.db.NoSync || common.IgnoreNoSync {
  		// gofail: var beforeSyncMetaPage struct{}
  		if err := fdatasync(tx.db); err != nil {
+diff --git a/cursor.go b/cursor.go
+--- a/cursor.go
++++ b/cursor.go
+@@ -74,7 +74,7 @@ func (c *Cursor) Last() (key []byte, value []byte) {
+ 
+ 	// If this is an empty page (calling Delete may result in empty pages)
+ 	// we call prev to find the last page that is not empty
+-	for len(c.stack) > 0 && c.stack[len(c.stack)-1].count() == 0 {
++	for len(c.stack) > 1 && c.stack[len(c.stack)-1].count() == 0 {
+ 		c.prev()
+ 	}
+ 
+@@ -257,6 +257,15 @@ func (c *Cursor) prev() (key []byte, value []byte, flags uint32) {
+ 			elem.index--
+ 			break
+ 		}
++		// If we've hit the beginning, we should stop moving the cursor,
++		// and stay at the first element, so that users can continue to
++		// iterate over the elements in reverse direction by calling `Next`.
++		// We should return nil in such case.
++		// Refer to https://github.com/etcd-io/bbolt/issues/733
++		if len(c.stack) == 1 {
++			c.first()
++			return nil, nil, 0
++		}
+ 		c.stack = c.stack[:i]
+ 	}
+ 
+diff --git a/db.go b/db.go
+--- a/db.go
++++ b/db.go
+@@ -539,12 +539,14 @@ func (db *DB) mmap(minsz int) (err error) {
+ 	db.meta0 = db.page(0).Meta()
+ 	db.meta1 = db.page(1).Meta()
+ 
+-	// Validate both meta pages.
+-	if err := db.meta0.Validate(); err != nil {
+-		return err
+-	}
+-	if err := db.meta1.Validate(); err != nil {
+-		return err
++	// Validate the meta pages. We only return an error if both meta pages fail
++	// validation, since meta0 failing validation means that it wasn't saved
++	// properly -- but we can recover using meta1. And vice-versa.
++	err0 := db.meta0.Validate()
++	err1 := db.meta1.Validate()
++	if err0 != nil && err1 != nil {
++		lg.Errorf("both meta pages are invalid, meta0: %v, meta1: %v", err0, err1)
++		return err0
+ 	}
+ 
+ 	return nil
+@@ -1137,10 +1139,26 @@ func (db *DB) pageInBuffer(b []byte, id common.Pgid) *common.Page {
+ 
+ // meta retrieves the current meta page reference.
+ func (db *DB) meta() *common.Meta {
+-	if db.meta0.Txid() > db.meta1.Txid() {
+-		return db.meta0
+-	}
+-	return db.meta1
++	// We have to return the meta with the highest txid which doesn't fail
++	// validation. Otherwise, we can cause errors when in fact the database is
++	// in a consistent state. metaA is the one with the higher txid.
++	metaA := db.meta0
++	metaB := db.meta1
++	if db.meta1.Txid() > db.meta0.Txid() {
++		metaA = db.meta1
++		metaB = db.meta0
++	}
++
++	// Use higher meta page if valid. Otherwise, fallback to previous, if valid.
++	if err := metaA.Validate(); err == nil {
++		return metaA
++	} else if err := metaB.Validate(); err == nil {
++		return metaB
++	}
++
++	// This should never be reached, because both meta1 and meta0 were validated
++	// on mmap() and we do fsync() on every write.
++	panic("bolt.DB.meta(): invalid meta pages")
+ }
+ 
+ // allocate returns a contiguous block of memory starting at a given page.
+@@ -1245,7 +1263,7 @@ func (db *DB) grow(sz int) error {
+ func (db *DB) growSize(mmapSize, growSize int) int {
+ 	// If the data is smaller than the alloc size then only allocate what's needed.
+ 	// Once it goes over the allocation size then allocate in chunks.
+-	if mmapSize < db.AllocSize {
++	if mmapSize <= db.AllocSize {
+ 		return mmapSize
+ 	} else {
+ 		return growSize + db.AllocSize
+diff --git a/tx.go b/tx.go
+--- a/tx.go
++++ b/tx.go
+@@ -197,6 +197,8 @@ func (tx *Tx) Commit() (err error) {
+ 		tx.stats.IncRebalanceTime(time.Since(startTime))
+ 	}
+ 
++	opgid := tx.meta.Pgid()
++
+ 	// spill data onto dirty pages.
+ 	startTime = time.Now()
+ 	if err = tx.root.spill(); err != nil {
+@@ -224,6 +226,19 @@ func (tx *Tx) Commit() (err error) {
+ 		tx.meta.SetFreelist(common.PgidNoFreelist)
+ 	}
+ 
++	// If the high water mark has moved up then attempt to grow the database.
++	if tx.meta.Pgid() > opgid {
++		_ = errors.New("")
++		// gofail: var lackOfDiskSpace string
++		// tx.rollback()
++		// return errors.New(lackOfDiskSpace)
++		if err = tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
++			lg.Errorf("growing db size failed, pgid: %d, pagesize: %d, error: %v", tx.meta.Pgid(), tx.db.pageSize, err)
++			tx.rollback()
++			return err
++		}
++	}
++
+ 	// Write dirty pages to disk.
+ 	startTime = time.Now()
+ 	if err = tx.write(); err != nil {
+@@ -268,8 +283,6 @@ func (tx *Tx) Commit() (err error) {
+ }
+ 
+ func (tx *Tx) commitFreelist() error {
+-	opgid := tx.meta.Pgid()
+-
+ 	// Allocate new pages for the new free list. This will overestimate
+ 	// the size of the freelist but not underestimate the size (which would be bad).
+ 	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
+@@ -281,18 +294,6 @@ func (tx *Tx) commitFreelist() error {
+ 	tx.db.freelist.Write(p)
+ 	tx.meta.SetFreelist(p.Id())
+ 
+-	// If the high water mark has moved up then attempt to grow the database.
+-	if tx.meta.Pgid() > opgid {
+-		_ = errors.New("")
+-		// gofail: var lackOfDiskSpace string
+-		// tx.rollback()
+-		// return errors.New(lackOfDiskSpace)
+-		if err := tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
+-			tx.rollback()
+-			return err
+-		}
+-	}
+-
+ 	return nil
+ }
+ 
+@@ -376,16 +377,43 @@ func (tx *Tx) Copy(w io.Writer) error {
+ // WriteTo writes the entire database to a writer.
+ // If err == nil then exactly tx.Size() bytes will be written into the writer.
+ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
+-	// Attempt to open reader with WriteFlag.
+-	f, err := tx.db.openFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
+-	if err != nil {
+-		return 0, err
+-	}
+-	defer func() {
+-		if cerr := f.Close(); err == nil {
+-			err = cerr
++	var f *os.File
++	// There is a risk that between the time a read-only transaction
++	// is created and the time the file is actually opened, the
++	// underlying db file at tx.db.path may have been replaced
++	// (e.g. via rename). In that case, opening the file again would
++	// unexpectedly point to a different file, rather than the one
++	// the transaction was based on.
++	//
++	// To overcome this, we reuse the already opened file handle when
++	// WriteFlag not set. When the WriteFlag is set, we reopen the file
++	// but verify that it still refers to the same underlying file
++	// (by device and inode). If it does not, we fall back to
++	// reusing the existing already opened file handle.
++	if tx.WriteFlag != 0 {
++		// Attempt to open reader with WriteFlag
++		f, err = tx.db.openFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
++		if err != nil {
++			return 0, err
+ 		}
+-	}()
++
++		if ok, err := sameFile(tx.db.file, f); !ok {
++			lg := tx.db.Logger()
++			if cerr := f.Close(); cerr != nil {
++				lg.Errorf("failed to close the file (%s): %v", tx.db.path, cerr)
++			}
++			lg.Warningf("The underlying file has changed, so reuse the already opened file (%s): %v", tx.db.path, err)
++			f = tx.db.file
++		} else {
++			defer func() {
++				if cerr := f.Close(); err == nil {
++					err = cerr
++				}
++			}()
++		}
++	} else {
++		f = tx.db.file
++	}
+ 
+ 	// Generate a meta page. We use the same page data for both meta pages.
+ 	buf := make([]byte, tx.db.pageSize)
+@@ -412,13 +440,13 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
+ 		return n, fmt.Errorf("meta 1 copy: %s", err)
+ 	}
+ 
+-	// Move past the meta pages in the file.
+-	if _, err := f.Seek(int64(tx.db.pageSize*2), io.SeekStart); err != nil {
+-		return n, fmt.Errorf("seek: %s", err)
+-	}
++	// Copy data pages using a SectionReader to avoid affecting f's offset.
++	dataOffset := int64(tx.db.pageSize * 2)
++	dataSize := tx.Size() - dataOffset
++	sr := io.NewSectionReader(f, dataOffset, dataSize)
+ 
+ 	// Copy data pages.
+-	wn, err := io.CopyN(w, f, tx.Size()-int64(tx.db.pageSize*2))
++	wn, err := io.CopyN(w, sr, dataSize)
+ 	n += wn
+ 	if err != nil {
+ 		return n, err
+@@ -427,6 +455,19 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
+ 	return n, nil
+ }
+ 
++func sameFile(f1, f2 *os.File) (bool, error) {
++	fi1, err := f1.Stat()
++	if err != nil {
++		return false, fmt.Errorf("failed to get fileInfo of the first file (%s): %w", f1.Name(), err)
++	}
++	fi2, err := f2.Stat()
++	if err != nil {
++		return false, fmt.Errorf("failed to get fileInfo of the second file (%s): %w", f2.Name(), err)
++	}
++
++	return os.SameFile(fi1, fi2), nil
++}
++
+ // CopyFile copies the entire database to file at the given path.
+ // A reader transaction is maintained during the copy so it is safe to continue
+ // using the database while a copy is in progress.
