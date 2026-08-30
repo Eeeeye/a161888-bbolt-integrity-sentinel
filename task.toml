@@ -6,7 +6,7 @@ description = "Repair corruption traversal, panic containment, transaction rollb
 keywords = ["go", "bbolt", "database", "integrity", "transactions", "concurrency", "recovery", "cursor", "snapshot"]
 
 [metadata]
-difficulty = "hard"
+difficulty = "expert"
 category = "programming"
 tags = ["l4", "storage-engine", "corruption", "fault-injection", "concurrency", "judge-grading"]
 
