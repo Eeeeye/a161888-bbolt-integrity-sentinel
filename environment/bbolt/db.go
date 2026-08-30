@@ -148,7 +148,8 @@ type DB struct {
 	statlock sync.RWMutex // Protects stats access.
 
 	ops struct {
-		writeAt func(b []byte, off int64) (n int, err error)
+		writeAt  func(b []byte, off int64) (n int, err error)
+		syncMeta func() error
 	}
 
 	// Read only mode.
@@ -256,8 +257,9 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		return nil, err
 	}
 
-	// Default values for test hooks
+	// Default values for injectable I/O boundaries.
 	db.ops.writeAt = db.file.WriteAt
+	db.ops.syncMeta = func() error { return fdatasync(db) }
 
 	if db.pageSize = options.PageSize; db.pageSize == 0 {
 		// Set the default page size to the OS page size.

@@ -112,3 +112,56 @@ func TestActivity161888XRayPreservesDistinctBucketPaths(t *testing.T) {
 		t.Fatalf("shared-key paths terminate on %d distinct leaves, want 2", len(leafs))
 	}
 }
+
+func TestActivity161888XRayDoesNotConfuseSharedChildWithCycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared-child.db")
+	activity161888CreateXRayDB(t, path, []byte("records"))
+
+	initial, err := NewXRay(path).FindPathsToKey([]byte("0001"))
+	if err != nil {
+		t.Fatalf("find initial path: %v", err)
+	}
+	if len(initial) != 1 || len(initial[0]) < 3 {
+		t.Fatalf("fixture path is not a materialized bucket path: %v", initial)
+	}
+	pathToKey := initial[0]
+	branchID := pathToKey[len(pathToKey)-2]
+	leafID := pathToKey[len(pathToKey)-1]
+	branch, buf, err := guts_cli.ReadPage(path, uint64(branchID))
+	if err != nil {
+		t.Fatalf("read parent branch page: %v", err)
+	}
+	if !branch.IsBranchPage() || branch.Count() < 2 {
+		t.Fatalf("parent page %d is %s with %d elements, want a multi-child branch", branchID, branch.Typ(), branch.Count())
+	}
+
+	originalIndex := -1
+	for i := uint16(0); i < branch.Count(); i++ {
+		if branch.BranchPageElement(i).Pgid() == leafID {
+			originalIndex = int(i)
+			break
+		}
+	}
+	if originalIndex < 0 {
+		t.Fatalf("branch page %d does not reference leaf %d", branchID, leafID)
+	}
+	sharedIndex := (originalIndex + 1) % int(branch.Count())
+	branch.BranchPageElement(uint16(sharedIndex)).SetPgid(leafID)
+	if err := guts_cli.WritePage(path, buf); err != nil {
+		t.Fatalf("write acyclic shared-child graph: %v", err)
+	}
+
+	paths, err := NewXRay(path).FindPathsToKey([]byte("0001"))
+	if err != nil {
+		t.Fatalf("acyclic shared child was reported as a cycle: %v", err)
+	}
+	var matching int
+	for _, found := range paths {
+		if len(found) != 0 && found[len(found)-1] == leafID {
+			matching++
+		}
+	}
+	if matching != 2 {
+		t.Fatalf("shared child produced %d matching routes, want 2: %v", matching, paths)
+	}
+}

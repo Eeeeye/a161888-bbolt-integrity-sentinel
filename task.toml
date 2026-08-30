@@ -2,7 +2,7 @@ schema_version = "1.1"
 
 [task]
 name = "talents/a161888-bbolt-integrity-sentinel"
-description = "Repair corruption traversal, panic containment, transaction rollback, cursor state, snapshot copying, file growth, and meta recovery defects in bbolt."
+description = "Repair path-local corruption traversal, panic containment, rollback, durable metadata publication, cursor state, snapshot copying, file growth, and structural meta recovery defects in bbolt."
 keywords = ["go", "bbolt", "database", "integrity", "transactions", "concurrency", "recovery", "cursor", "snapshot"]
 
 [metadata]

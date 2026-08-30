@@ -390,3 +390,153 @@ func TestActivity161888OpenFallsBackFromCorruptNewestMeta(t *testing.T) {
 		t.Fatalf("validate fallback snapshot: %v", err)
 	}
 }
+
+func TestActivity161888OpenFallsBackFromChecksumValidImpossibleMeta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-structural-fallback.db")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	if err := db.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket([]byte("records"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("anchor"), []byte("committed"))
+	}); err != nil {
+		t.Fatalf("write fallback transaction: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Bucket([]byte("records")).Put([]byte("newest-only"), []byte("discarded"))
+	}); err != nil {
+		t.Fatalf("write newest transaction: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close before structural meta corruption: %v", err)
+	}
+
+	active, activeID, err := guts_cli.GetActiveMetaPage(path)
+	if err != nil {
+		t.Fatalf("locate active meta: %v", err)
+	}
+	activeTxid := active.Txid()
+	p, buf, err := guts_cli.ReadPage(path, uint64(activeID))
+	if err != nil {
+		t.Fatalf("read active meta page: %v", err)
+	}
+	root := *p.Meta().RootBucket()
+	root.SetRootPage(p.Meta().Pgid())
+	p.Meta().SetRootBucket(root)
+	p.Meta().SetChecksum(p.Meta().Sum64())
+	if err := guts_cli.WritePage(path, buf); err != nil {
+		t.Fatalf("write checksum-valid impossible meta: %v", err)
+	}
+
+	recovered, err := Open(path, 0o600, &Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("open with older structurally valid meta page: %v", err)
+	}
+	defer recovered.Close()
+	if err := recovered.View(func(tx *Tx) error {
+		if tx.ID() >= int(activeTxid) {
+			return fmt.Errorf("used structurally impossible newest meta txid %d (active %d)", tx.ID(), activeTxid)
+		}
+		b := tx.Bucket([]byte("records"))
+		if b == nil || !bytes.Equal(b.Get([]byte("anchor")), []byte("committed")) {
+			return fmt.Errorf("structural fallback lost committed anchor")
+		}
+		if got := b.Get([]byte("newest-only")); got != nil {
+			return fmt.Errorf("structural fallback exposed newest-only value %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("validate structural fallback snapshot: %v", err)
+	}
+}
+
+func TestActivity161888OpenFallsBackFromChecksumValidImpossibleFreelist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-freelist-fallback.db")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	if err := db.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket([]byte("records"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("anchor"), []byte("committed"))
+	}); err != nil {
+		t.Fatalf("write fallback transaction: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Bucket([]byte("records")).Put([]byte("newest-only"), []byte("discarded"))
+	}); err != nil {
+		t.Fatalf("write newest transaction: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close before freelist meta corruption: %v", err)
+	}
+
+	active, activeID, err := guts_cli.GetActiveMetaPage(path)
+	if err != nil {
+		t.Fatalf("locate active meta: %v", err)
+	}
+	activeTxid := active.Txid()
+	p, buf, err := guts_cli.ReadPage(path, uint64(activeID))
+	if err != nil {
+		t.Fatalf("read active meta page: %v", err)
+	}
+	p.Meta().SetFreelist(p.Meta().Pgid())
+	p.Meta().SetChecksum(p.Meta().Sum64())
+	if err := guts_cli.WritePage(path, buf); err != nil {
+		t.Fatalf("write checksum-valid impossible freelist meta: %v", err)
+	}
+
+	recovered, err := Open(path, 0o600, &Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("open with older structurally valid meta page: %v", err)
+	}
+	defer recovered.Close()
+	if err := recovered.View(func(tx *Tx) error {
+		if tx.ID() >= int(activeTxid) {
+			return fmt.Errorf("used impossible-freelist newest meta txid %d (active %d)", tx.ID(), activeTxid)
+		}
+		b := tx.Bucket([]byte("records"))
+		if b == nil || !bytes.Equal(b.Get([]byte("anchor")), []byte("committed")) {
+			return fmt.Errorf("freelist fallback lost committed anchor")
+		}
+		if got := b.Get([]byte("newest-only")); got != nil {
+			return fmt.Errorf("freelist fallback exposed newest-only value %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("validate freelist fallback snapshot: %v", err)
+	}
+}
+
+func TestActivity161888OpenRejectsTwoChecksumValidImpossibleMetas(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-structural-invalid.db")
+	db := activity161888Open(t, path, &Options{PageSize: 4096})
+	activity161888Fill(t, db, []byte("records"), 40, 32)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close before corrupting both meta pages: %v", err)
+	}
+
+	for metaID := uint64(0); metaID < 2; metaID++ {
+		p, buf, err := guts_cli.ReadPage(path, metaID)
+		if err != nil {
+			t.Fatalf("read meta page %d: %v", metaID, err)
+		}
+		root := *p.Meta().RootBucket()
+		root.SetRootPage(p.Meta().Pgid())
+		p.Meta().SetRootBucket(root)
+		p.Meta().SetChecksum(p.Meta().Sum64())
+		if err := guts_cli.WritePage(path, buf); err != nil {
+			t.Fatalf("write structurally impossible meta page %d: %v", metaID, err)
+		}
+	}
+
+	opened, err := Open(path, 0o600, &Options{PageSize: 4096})
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("open accepted two checksum-valid but structurally impossible meta pages")
+	}
+	if err == nil {
+		t.Fatal("open returned no error for two structurally impossible meta pages")
+	}
+}

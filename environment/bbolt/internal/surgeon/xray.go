@@ -23,6 +23,10 @@ func NewXRay(path string) XRay {
 
 func (n XRay) traverse(stack []common.Pgid, visited map[common.Pgid]struct{}, callback func(page *common.Page, stack []common.Pgid) error) error {
 	pgid := stack[len(stack)-1]
+	if _, ok := visited[pgid]; ok {
+		return fmt.Errorf("cycle detected at page %d (stack %v)", pgid, stack)
+	}
+	visited[pgid] = struct{}{}
 
 	p, data, err := guts_cli.ReadPage(n.path, uint64(pgid))
 	if err != nil {

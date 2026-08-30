@@ -1,17 +1,28 @@
 diff --git a/internal/surgeon/xray.go b/internal/surgeon/xray.go
 --- a/internal/surgeon/xray.go
 +++ b/internal/surgeon/xray.go
-@@ -23,6 +23,10 @@ type XRay struct {
- 
- func (n XRay) traverse(stack []common.Pgid, visited map[common.Pgid]struct{}, callback func(page *common.Page, stack []common.Pgid) error) error {
- 	pgid := stack[len(stack)-1]
-+	if _, ok := visited[pgid]; ok {
-+		return fmt.Errorf("cycle detected at page %d (stack %v)", pgid, stack)
-+	}
-+	visited[pgid] = struct{}{}
+@@ -26,6 +26,7 @@ func (n XRay) traverse(stack []common.Pgid, visited map[common.Pgid]struct{}, callback func(page *common.Page, stack []common.Pgid) error) error {
+ 	if _, ok := visited[pgid]; ok {
+ 		return fmt.Errorf("cycle detected at page %d (stack %v)", pgid, stack)
+ 	}
+ 	visited[pgid] = struct{}{}
++	defer delete(visited, pgid)
  
  	p, data, err := guts_cli.ReadPage(n.path, uint64(pgid))
- 	if err != nil {
+diff --git a/internal/common/meta.go b/internal/common/meta.go
+--- a/internal/common/meta.go
++++ b/internal/common/meta.go
+@@ -30,7 +30,9 @@ func (m *Meta) Validate() error {
+ 	} else if m.checksum != m.Sum64() {
+ 		return errors.ErrChecksum
+-	} else if m.root.root > m.pgid {
++	} else if m.root.root >= m.pgid {
+ 		return fmt.Errorf("%w: root bucket pgid (%d) above high water mark (%d)", errors.ErrInvalid, m.root.root, m.pgid)
++	} else if m.freelist >= m.pgid && m.freelist != PgidNoFreelist {
++		return fmt.Errorf("%w: freelist pgid (%d) above high water mark (%d)", errors.ErrInvalid, m.freelist, m.pgid)
+ 	}
+ 	return nil
+ }
 diff --git a/tx_check.go b/tx_check.go
 --- a/tx_check.go
 +++ b/tx_check.go
@@ -85,20 +96,27 @@ diff --git a/tx.go b/tx.go
  	}
  	tx.close()
  }
-@@ -591,10 +603,13 @@ func (tx *Tx) writeMeta() error {
+@@ -591,14 +603,19 @@ func (tx *Tx) writeMeta() error {
  	tx.meta.Write(p)
  
  	// Write the meta page to file.
 +	tx.db.metalock.Lock()
- 	if _, err := tx.db.ops.writeAt(buf, int64(p.Id())*int64(tx.db.pageSize)); err != nil {
-+		tx.db.metalock.Unlock()
++	defer tx.db.metalock.Unlock()
+-	if _, err := tx.db.ops.writeAt(buf, int64(p.Id())*int64(tx.db.pageSize)); err != nil {
++	if n, err := tx.db.ops.writeAt(buf, int64(p.Id())*int64(tx.db.pageSize)); err != nil {
  		lg.Errorf("writeAt failed, pgid: %d, pageSize: %d, error: %v", p.Id(), tx.db.pageSize, err)
  		return err
++	} else if n != len(buf) {
++		lg.Errorf("short meta write, pgid: %d, pageSize: %d, wrote: %d", p.Id(), tx.db.pageSize, n)
++		return io.ErrShortWrite
  	}
-+	tx.db.metalock.Unlock()
  	if !tx.db.NoSync || common.IgnoreNoSync {
  		// gofail: var beforeSyncMetaPage struct{}
- 		if err := fdatasync(tx.db); err != nil {
+ 		if err := tx.db.ops.syncMeta(); err != nil {
+ 			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %w", runtime.GOOS, runtime.GOARCH, err)
+ 			return err
+ 		}
+ 	}
 diff --git a/cursor.go b/cursor.go
 --- a/cursor.go
 +++ b/cursor.go

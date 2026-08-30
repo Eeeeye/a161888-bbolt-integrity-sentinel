@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -583,5 +584,166 @@ func TestActivity161888MetaPublicationLocksReaders(t *testing.T) {
 	}
 	if err := result.tx.Rollback(); err != nil {
 		t.Fatalf("close reader: %v", err)
+	}
+}
+
+func TestActivity161888MetaPublicationLocksThroughDurability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-durability.db")
+	bucket := []byte("records")
+	db := activity161888Open(t, path, &Options{PageSize: 4096, InitialMmapSize: 1 << 20})
+	activity161888Fill(t, db, bucket, 10, 40)
+
+	originalSyncMeta := db.ops.syncMeta
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var blocked atomic.Bool
+	db.ops.syncMeta = func() error {
+		if blocked.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+		return originalSyncMeta()
+	}
+	t.Cleanup(func() { db.ops.syncMeta = originalSyncMeta })
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- db.Update(func(tx *Tx) error {
+			return tx.Bucket(bucket).Put([]byte("durable"), []byte("value"))
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writer never reached the metadata durability boundary")
+	}
+
+	type readResult struct {
+		tx  *Tx
+		err error
+	}
+	readerDone := make(chan readResult, 1)
+	go func() {
+		tx, err := db.Begin(false)
+		readerDone <- readResult{tx: tx, err: err}
+	}()
+
+	select {
+	case result := <-readerDone:
+		if result.tx != nil {
+			_ = result.tx.Rollback()
+		}
+		t.Fatal("read transaction began before metadata durability completed")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("writer commit: %v", err)
+	}
+
+	var result readResult
+	select {
+	case result = <-readerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader did not resume after metadata durability completed")
+	}
+	if result.err != nil {
+		t.Fatalf("begin reader after durability: %v", result.err)
+	}
+	if got := result.tx.Bucket(bucket).Get([]byte("durable")); !bytes.Equal(got, []byte("value")) {
+		_ = result.tx.Rollback()
+		t.Fatalf("reader observed incomplete durable publication: %q", got)
+	}
+	if err := result.tx.Rollback(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+}
+
+func TestActivity161888MetaShortWriteFailsAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-short-write.db")
+	bucket := []byte("records")
+	db := activity161888Open(t, path, &Options{PageSize: 4096, InitialMmapSize: 1 << 20, NoSync: true})
+	activity161888Fill(t, db, bucket, 10, 40)
+
+	originalWriteAt := db.ops.writeAt
+	var injected atomic.Bool
+	db.ops.writeAt = func(data []byte, offset int64) (int, error) {
+		if (offset == 0 || offset == int64(db.pageSize)) && injected.CompareAndSwap(false, true) {
+			return len(data) - 1, nil
+		}
+		return originalWriteAt(data, offset)
+	}
+	err := db.Update(func(tx *Tx) error {
+		return tx.Bucket(bucket).Put([]byte("short-write"), []byte("must-not-commit"))
+	})
+	db.ops.writeAt = originalWriteAt
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short metadata write returned %v, want %v", err, io.ErrShortWrite)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		if got := tx.Bucket(bucket).Get([]byte("short-write")); got != nil {
+			return fmt.Errorf("short metadata write published value %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view after short metadata write: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Bucket(bucket).Put([]byte("recovery"), []byte("ok"))
+	}); err != nil {
+		t.Fatalf("commit after short metadata write: %v", err)
+	}
+}
+
+func TestActivity161888MetaSyncErrorReleasesReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta-sync-error.db")
+	bucket := []byte("records")
+	db := activity161888Open(t, path, &Options{PageSize: 4096, InitialMmapSize: 1 << 20})
+	activity161888Fill(t, db, bucket, 10, 40)
+
+	originalSyncMeta := db.ops.syncMeta
+	injected := errors.New("activity161888: injected metadata sync failure")
+	var failed atomic.Bool
+	db.ops.syncMeta = func() error {
+		if failed.CompareAndSwap(false, true) {
+			return injected
+		}
+		return originalSyncMeta()
+	}
+	err := db.Update(func(tx *Tx) error {
+		return tx.Bucket(bucket).Put([]byte("sync-failed"), []byte("complete-value"))
+	})
+	db.ops.syncMeta = originalSyncMeta
+	if !errors.Is(err, injected) {
+		t.Fatalf("metadata sync failure returned %v, want injected error", err)
+	}
+
+	viewDone := make(chan error, 1)
+	go func() {
+		viewDone <- db.View(func(tx *Tx) error {
+			if got := tx.Bucket(bucket).Get([]byte("sync-failed")); got != nil && !bytes.Equal(got, []byte("complete-value")) {
+				return fmt.Errorf("metadata sync failure exposed a partial value %q", got)
+			}
+			for checkErr := range tx.Check() {
+				return checkErr
+			}
+			return nil
+		})
+	}()
+	select {
+	case err := <-viewDone:
+		if err != nil {
+			t.Fatalf("view after metadata sync failure: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("metadata sync failure left readers blocked")
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Bucket(bucket).Put([]byte("recovery-after-sync"), []byte("ok"))
+	}); err != nil {
+		t.Fatalf("commit after metadata sync failure: %v", err)
 	}
 }

@@ -556,7 +556,7 @@ func (tx *Tx) writeMeta() error {
 	}
 	if !tx.db.NoSync || common.IgnoreNoSync {
 		// gofail: var beforeSyncMetaPage struct{}
-		if err := fdatasync(tx.db); err != nil {
+		if err := tx.db.ops.syncMeta(); err != nil {
 			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %w", runtime.GOOS, runtime.GOARCH, err)
 			return err
 		}

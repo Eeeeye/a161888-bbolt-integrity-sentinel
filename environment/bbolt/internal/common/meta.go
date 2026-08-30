@@ -29,6 +29,8 @@ func (m *Meta) Validate() error {
 		return errors.ErrVersionMismatch
 	} else if m.checksum != m.Sum64() {
 		return errors.ErrChecksum
+	} else if m.root.root > m.pgid {
+		return fmt.Errorf("%w: root bucket pgid (%d) above high water mark (%d)", errors.ErrInvalid, m.root.root, m.pgid)
 	}
 	return nil
 }
