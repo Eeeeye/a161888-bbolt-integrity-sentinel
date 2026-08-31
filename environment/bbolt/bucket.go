@@ -352,11 +352,6 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
 		return errors.ErrTxNotWritable
 	}
 
-	if b.tx.db.Path() != dstBucket.tx.db.Path() || b.tx != dstBucket.tx {
-		lg.Errorf("The source and target buckets are not in the same db file, source bucket in %s and target bucket in %s", b.tx.db.Path(), dstBucket.tx.db.Path())
-		return errors.ErrDifferentDB
-	}
-
 	newKey := cloneBytes(key)
 
 	// Move cursor to correct position.

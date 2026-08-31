@@ -13,6 +13,7 @@ mkdir -p "$original_tests"
 restore() {
   rm -f "$app_root/zz_activity161888_root_test.go"
   rm -f "$app_root/zz_activity161888_extended_test.go"
+  rm -f "$app_root/zz_activity161888_lifecycle_test.go"
   rm -f "$app_root/internal/surgeon/zz_activity161888_surgeon_test.go"
 
   if [[ -f "$backup_root/go.mod" ]]; then
@@ -42,6 +43,7 @@ done < <(find "$app_root" -type f -name '*_test.go' -print0)
 
 cp "$test_root/activity161888_root_test.go" "$app_root/zz_activity161888_root_test.go"
 cp "$test_root/activity161888_extended_test.go" "$app_root/zz_activity161888_extended_test.go"
+cp "$test_root/activity161888_lifecycle_test.go" "$app_root/zz_activity161888_lifecycle_test.go"
 cp "$test_root/activity161888_surgeon_test.go" "$app_root/internal/surgeon/zz_activity161888_surgeon_test.go"
 
 cd "$app_root" || exit 1

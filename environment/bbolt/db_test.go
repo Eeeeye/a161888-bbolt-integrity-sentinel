@@ -910,62 +910,6 @@ func TestDB_BeginRW_Closed(t *testing.T) {
 	}
 }
 
-func TestDB_Close_PendingTx_RW(t *testing.T) { testDB_Close_PendingTx(t, true) }
-func TestDB_Close_PendingTx_RO(t *testing.T) { testDB_Close_PendingTx(t, false) }
-
-// Ensure that a database cannot close while transactions are open.
-func testDB_Close_PendingTx(t *testing.T, writable bool) {
-	db := btesting.MustCreateDB(t)
-
-	// Start transaction.
-	tx, err := db.Begin(writable)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Open update in separate goroutine.
-	startCh := make(chan struct{}, 1)
-	done := make(chan error, 1)
-	go func() {
-		startCh <- struct{}{}
-		err := db.Close()
-		done <- err
-	}()
-	// wait for the above goroutine to get scheduled.
-	<-startCh
-
-	// Ensure database hasn't closed.
-	time.Sleep(100 * time.Millisecond)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("error from inside goroutine: %v", err)
-		}
-		t.Fatal("database closed too early")
-	default:
-	}
-
-	// Commit/close transaction.
-	if writable {
-		err = tx.Commit()
-	} else {
-		err = tx.Rollback()
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Ensure database closed now.
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("error from inside goroutine: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("database did not close")
-	}
-}
-
 // Ensure a database can provide a transactional block.
 func TestDB_Update(t *testing.T) {
 	db := btesting.MustCreateDB(t)
@@ -1114,49 +1058,6 @@ func TestDB_View_ManualRollback(t *testing.T) {
 	}
 }
 
-// Ensure a write transaction that panics does not hold open locks.
-func TestDB_Update_Panic(t *testing.T) {
-	db := btesting.MustCreateDB(t)
-
-	// Panic during update but recover.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Log("recover: update", r)
-			}
-		}()
-
-		if err := db.Update(func(tx *bolt.Tx) error {
-			if _, err := tx.CreateBucket([]byte("widgets")); err != nil {
-				t.Fatal(err)
-			}
-			panic("omg")
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	// Verify we can update again.
-	if err := db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucket([]byte("widgets")); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify that our change persisted.
-	if err := db.Update(func(tx *bolt.Tx) error {
-		if tx.Bucket([]byte("widgets")) == nil {
-			t.Fatal("expected bucket")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // Ensure a database can return an error through a read-only transactional block.
 func TestDB_View_Error(t *testing.T) {
 	db := btesting.MustCreateDB(t)
@@ -1165,48 +1066,6 @@ func TestDB_View_Error(t *testing.T) {
 		return errors.New("xxx")
 	}); err == nil || err.Error() != "xxx" {
 		t.Fatalf("unexpected error: %s", err)
-	}
-}
-
-// Ensure a read transaction that panics does not hold open locks.
-func TestDB_View_Panic(t *testing.T) {
-	db := btesting.MustCreateDB(t)
-
-	if err := db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucket([]byte("widgets")); err != nil {
-			t.Fatal(err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Panic during view transaction but recover.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Log("recover: view", r)
-			}
-		}()
-
-		if err := db.View(func(tx *bolt.Tx) error {
-			if tx.Bucket([]byte("widgets")) == nil {
-				t.Fatal("expected bucket")
-			}
-			panic("omg")
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	// Verify that we can still use read transactions.
-	if err := db.View(func(tx *bolt.Tx) error {
-		if tx.Bucket([]byte("widgets")) == nil {
-			t.Fatal("expected bucket")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -1357,36 +1216,6 @@ func TestDB_Batch(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestDB_Batch_Panic(t *testing.T) {
-	db := btesting.MustCreateDB(t)
-
-	var sentinel int
-	var bork = &sentinel
-	var problem interface{}
-	var err error
-
-	// Execute a function inside a batch that panics.
-	func() {
-		defer func() {
-			if p := recover(); p != nil {
-				problem = p
-			}
-		}()
-		err = db.Batch(func(tx *bolt.Tx) error {
-			panic(bork)
-		})
-	}()
-
-	// Verify there is no error.
-	if g, e := err, error(nil); g != e {
-		t.Fatalf("wrong error: %v != %v", g, e)
-	}
-	// Verify the panic was captured.
-	if g, e := problem, bork; g != e {
-		t.Fatalf("wrong error: %v != %v", g, e)
 	}
 }
 

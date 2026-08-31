@@ -361,3 +361,60 @@ diff --git a/tx.go b/tx.go
  // CopyFile copies the entire database to file at the given path.
  // A reader transaction is maintained during the copy so it is safe to continue
  // using the database while a copy is in progress.
+diff --git a/db.go b/db.go
+--- a/db.go
++++ b/db.go
+@@ -698,8 +698,8 @@ func (db *DB) Close() error {
+ 	db.metalock.Lock()
+ 	defer db.metalock.Unlock()
+ 
+-	db.mmaplock.RLock()
+-	defer db.mmaplock.RUnlock()
++	db.mmaplock.Lock()
++	defer db.mmaplock.Unlock()
+ 
+ 	return db.close()
+ }
+@@ -908,6 +908,13 @@ func (db *DB) Update(fn func(*Tx) error) error {
+ 		return err
+ 	}
+ 
++	// Make sure the transaction rolls back in the event of a panic.
++	defer func() {
++		if t.db != nil {
++			t.rollback()
++		}
++	}()
++
+ 	// Mark as a managed tx so that the inner function cannot manually commit.
+ 	t.managed = true
+ 
+@@ -932,6 +939,13 @@ func (db *DB) View(fn func(*Tx) error) error {
+ 		return err
+ 	}
+ 
++	// Make sure the transaction rolls back in the event of a panic.
++	defer func() {
++		if t.db != nil {
++			t.rollback()
++		}
++	}()
++
+ 	// Mark as a managed tx so that the inner function cannot manually rollback.
+ 	t.managed = true
+ 
+diff --git a/bucket.go b/bucket.go
+--- a/bucket.go
++++ b/bucket.go
+@@ -351,6 +351,11 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
+ 		return errors.ErrTxNotWritable
+ 	}
+ 
++	if b.tx.db.Path() != dstBucket.tx.db.Path() || b.tx != dstBucket.tx {
++		lg.Errorf("The source and target buckets are not in the same db file, source bucket in %s and target bucket in %s", b.tx.db.Path(), dstBucket.tx.db.Path())
++		return errors.ErrDifferentDB
++	}
++
+ 	newKey := cloneBytes(key)
+ 
+ 	// Move cursor to correct position.

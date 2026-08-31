@@ -698,8 +698,8 @@ func (db *DB) Close() error {
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
 
-	db.mmaplock.Lock()
-	defer db.mmaplock.Unlock()
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
 
 	return db.close()
 }
@@ -908,13 +908,6 @@ func (db *DB) Update(fn func(*Tx) error) error {
 		return err
 	}
 
-	// Make sure the transaction rolls back in the event of a panic.
-	defer func() {
-		if t.db != nil {
-			t.rollback()
-		}
-	}()
-
 	// Mark as a managed tx so that the inner function cannot manually commit.
 	t.managed = true
 
@@ -938,13 +931,6 @@ func (db *DB) View(fn func(*Tx) error) error {
 	if err != nil {
 		return err
 	}
-
-	// Make sure the transaction rolls back in the event of a panic.
-	defer func() {
-		if t.db != nil {
-			t.rollback()
-		}
-	}()
 
 	// Mark as a managed tx so that the inner function cannot manually rollback.
 	t.managed = true

@@ -13,6 +13,9 @@ You are maintaining an embedded key-value store used by a recovery service. A re
 7. Both streaming and copy-to-path exports from a read transaction must copy the file snapshot on which that transaction was opened, even if the database path is atomically replaced before copying. Concurrent exports must use independent read offsets, and a nonzero caller-supplied open flag must not silently switch to another inode.
 8. A commit that advances the high-water mark must grow the data file before writing dirty pages whether the free-page catalog is persisted or rebuilt. Omitting the catalog from commits must not bypass growth, and crossing the allocation-size boundary must retain chunked growth semantics.
 9. Opening a database with one invalid meta page must recover from the other valid committed meta page, choosing the newest valid transaction rather than the numerically newest invalid one. Validation must reject both checksum damage and checksum-valid metadata whose root or free-page reference is structurally impossible relative to its high-water mark. Opening must still fail when neither meta page is valid.
+10. Managed read and write callbacks must release their transaction on every panic path while preserving Go panic semantics. The original panic value must reach the caller, no write performed by the panicking callback may commit, and a later read, write, or batched write must not remain blocked by a leaked transaction.
+11. Closing a database must wait for both writable and read-only transactions that were already open. It must not unmap or close the underlying file while a reader can still use its snapshot; once those transactions finish, close must complete, release the file lock, and reject later transaction starts.
+12. Moving a bucket is valid only within the same writable transaction of the same database. A cross-database attempt must return the package's existing different-database error and leave both databases unchanged and usable.
 
 ## Constraints
 
@@ -21,4 +24,4 @@ You are maintaining an embedded key-value store used by a recovery service. A re
 - Do not modify evaluator tests, `/tests`, or reward files.
 - The final implementation must build with Go 1.25 and must not require network access during verification.
 
-All nine behaviors are required. Verification is closed and binary: any missing behavior receives reward `0`; the complete repair receives reward `1`.
+All twelve behaviors are required. Verification is closed and binary: any missing behavior receives reward `0`; the complete repair receives reward `1`.
