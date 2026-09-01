@@ -247,6 +247,89 @@ func TestActivity161888CloseWaitsForReadSnapshot(t *testing.T) {
 	}
 }
 
+func TestActivity161888CloseWaitsForWriteTransaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "close-writer.db")
+	db, err := Open(path, 0o600, &Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("open close-writer fixture: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("records"))
+		return err
+	}); err != nil {
+		_ = db.Close()
+		t.Fatalf("populate close-writer fixture: %v", err)
+	}
+
+	wtx, err := db.Begin(true)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("begin write transaction: %v", err)
+	}
+	if err := wtx.Bucket([]byte("records")).Put([]byte("before-close"), []byte("pending")); err != nil {
+		_ = wtx.Rollback()
+		_ = db.Close()
+		t.Fatalf("write before concurrent Close: %v", err)
+	}
+
+	started := make(chan struct{})
+	closed := make(chan error, 1)
+	go func() {
+		close(started)
+		closed <- db.Close()
+	}()
+	<-started
+
+	select {
+	case closeErr := <-closed:
+		_ = wtx.Rollback()
+		t.Fatalf("Close returned while write transaction was open: %v", closeErr)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := wtx.Bucket([]byte("records")).Put([]byte("while-close-waits"), []byte("committed")); err != nil {
+		_ = wtx.Rollback()
+		t.Fatalf("write transaction became unusable while Close waited: %v", err)
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatalf("commit write transaction while Close waited: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close after writer completion: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not finish after write transaction committed")
+	}
+	if tx, err := db.Begin(true); tx != nil || !stderrs.Is(err, bberrors.ErrDatabaseNotOpen) {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		t.Fatalf("writable Begin after Close returned tx=%v err=%v", tx, err)
+	}
+
+	reopened, err := Open(path, 0o600, &Options{PageSize: 4096})
+	if err != nil {
+		t.Fatalf("reopen after writer and Close released file lock: %v", err)
+	}
+	if err := reopened.View(func(tx *Tx) error {
+		b := tx.Bucket([]byte("records"))
+		if got := b.Get([]byte("before-close")); !bytes.Equal(got, []byte("pending")) {
+			return fmt.Errorf("first committed writer value=%q", got)
+		}
+		if got := b.Get([]byte("while-close-waits")); !bytes.Equal(got, []byte("committed")) {
+			return fmt.Errorf("second committed writer value=%q", got)
+		}
+		return nil
+	}); err != nil {
+		_ = reopened.Close()
+		t.Fatalf("verify committed writer after concurrent Close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened writer database: %v", err)
+	}
+}
+
 func TestActivity161888MoveBucketRejectsCrossDatabase(t *testing.T) {
 	srcPath := filepath.Join(t.TempDir(), "move-src.db")
 	dstPath := filepath.Join(t.TempDir(), "move-dst.db")
