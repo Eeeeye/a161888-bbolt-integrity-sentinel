@@ -346,6 +346,39 @@ func TestActivity161888RollbackReloadsFreelist(t *testing.T) {
 	if !activity161888EqualPgids(afterDisk, afterMemory) {
 		t.Fatalf("in-memory freelist was not restored from committed state: disk=%v memory=%v", afterDisk, afterMemory)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after failed transaction: %v", err)
+	}
+	db = activity161888Open(t, path, &Options{PageSize: 4096})
+	reopenedDisk := activity161888FreelistOnDisk(t, path)
+	reopenedMemory := activity161888FreelistInMemory(db)
+	if !activity161888EqualPgids(before, reopenedDisk) {
+		t.Fatalf("reopened failed transaction changed committed freelist: before=%v reopened=%v", before, reopenedDisk)
+	}
+	if !activity161888EqualPgids(reopenedDisk, reopenedMemory) {
+		t.Fatalf("reopened in-memory freelist differs from committed state: disk=%v memory=%v", reopenedDisk, reopenedMemory)
+	}
+	err = db.View(func(tx *Tx) error {
+		b := tx.Bucket(bucket)
+		for i := 0; i < 6; i++ {
+			if got := b.Get(keys[i]); got != nil {
+				return fmt.Errorf("reopened database restored deleted key %d: %q", i, got)
+			}
+		}
+		for i := 6; i < len(keys); i++ {
+			want := bytes.Repeat([]byte{byte(i + 1)}, 1500)
+			if got := b.Get(keys[i]); !bytes.Equal(got, want) {
+				return fmt.Errorf("reopened key %d value changed by failed transaction", i)
+			}
+		}
+		for checkErr := range tx.Check() {
+			return checkErr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reopened committed state after failed transaction: %v", err)
+	}
 
 	err = db.Update(func(tx *Tx) error {
 		return tx.Bucket(bucket).Put([]byte("recovery-write"), []byte("ok"))
@@ -364,6 +397,18 @@ func TestActivity161888RollbackReloadsFreelist(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("post-recovery consistency: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after recovery write: %v", err)
+	}
+	db = activity161888Open(t, path, &Options{PageSize: 4096})
+	if err := db.View(func(tx *Tx) error {
+		if got := tx.Bucket(bucket).Get([]byte("recovery-write")); !bytes.Equal(got, []byte("ok")) {
+			return fmt.Errorf("reopened recovery write value=%q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("reopen after recovery write: %v", err)
 	}
 }
 
@@ -448,18 +493,35 @@ func TestActivity161888RollbackPreservesNoFreelistSync(t *testing.T) {
 	if !activity161888EqualPgids(authoritative, afterMemory) {
 		t.Fatalf("no-freelist-sync rollback did not restore committed free pages: graph=%v memory=%v", authoritative, afterMemory)
 	}
-
+	if err := db.Close(); err != nil {
+		t.Fatalf("close no-freelist-sync database after failed transaction: %v", err)
+	}
+	db = activity161888Open(t, path, options)
 	err = db.View(func(tx *Tx) error {
 		b := tx.Bucket(bucket)
+		for i := 0; i < 6; i++ {
+			if got := b.Get(keys[i]); got != nil {
+				return fmt.Errorf("reopened no-freelist-sync database restored deleted key %d: %q", i, got)
+			}
+		}
+		for i := 6; i < len(keys); i++ {
+			want := bytes.Repeat([]byte{byte(i + 1)}, 1500)
+			if got := b.Get(keys[i]); !bytes.Equal(got, want) {
+				return fmt.Errorf("reopened no-freelist-sync key %d value changed by failed transaction", i)
+			}
+		}
 		for i := 0; i < 8; i++ {
 			if got := b.Get([]byte(fmt.Sprintf("failed-write-%02d", i))); got != nil {
-				return fmt.Errorf("failed transaction published key %d: %q", i, got)
+				return fmt.Errorf("reopened database contains failed key %d: %q", i, got)
 			}
+		}
+		for checkErr := range tx.Check() {
+			return checkErr
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("committed view after no-freelist-sync failure: %v", err)
+		t.Fatalf("reopened committed view after no-freelist-sync failure: %v", err)
 	}
 	err = db.Update(func(tx *Tx) error {
 		return tx.Bucket(bucket).Put([]byte("recovery-write"), []byte("ok"))
@@ -480,6 +542,12 @@ func TestActivity161888RollbackPreservesNoFreelistSync(t *testing.T) {
 		for i := 0; i < 8; i++ {
 			if got := b.Get([]byte(fmt.Sprintf("failed-write-%02d", i))); got != nil {
 				return fmt.Errorf("reopened database contains failed key %d: %q", i, got)
+			}
+		}
+		for i := 6; i < len(keys); i++ {
+			want := bytes.Repeat([]byte{byte(i + 1)}, 1500)
+			if got := b.Get(keys[i]); !bytes.Equal(got, want) {
+				return fmt.Errorf("post-recovery original key %d value changed", i)
 			}
 		}
 		for checkErr := range tx.Check() {
@@ -705,19 +773,37 @@ func TestActivity161888MetaSyncErrorReleasesReaders(t *testing.T) {
 
 	originalSyncMeta := db.ops.syncMeta
 	injected := errors.New("activity161888: injected metadata sync failure")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseWriter := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	defer releaseWriter()
 	var failed atomic.Bool
 	db.ops.syncMeta = func() error {
 		if failed.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
 			return injected
 		}
 		return originalSyncMeta()
 	}
-	err := db.Update(func(tx *Tx) error {
-		return tx.Bucket(bucket).Put([]byte("sync-failed"), []byte("complete-value"))
-	})
-	db.ops.syncMeta = originalSyncMeta
-	if !errors.Is(err, injected) {
-		t.Fatalf("metadata sync failure returned %v, want injected error", err)
+	t.Cleanup(func() { db.ops.syncMeta = originalSyncMeta })
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- db.Update(func(tx *Tx) error {
+			return tx.Bucket(bucket).Put([]byte("sync-failed"), []byte("complete-value"))
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writer never reached failing metadata durability boundary")
 	}
 
 	viewDone := make(chan error, 1)
@@ -734,11 +820,28 @@ func TestActivity161888MetaSyncErrorReleasesReaders(t *testing.T) {
 	}()
 	select {
 	case err := <-viewDone:
+		releaseWriter()
+		<-commitDone
 		if err != nil {
-			t.Fatalf("view after metadata sync failure: %v", err)
+			t.Fatalf("reader returned an error while durability was blocked: %v", err)
+		}
+		t.Fatal("reader returned before the failing metadata durability step completed")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseWriter()
+	err := <-commitDone
+	db.ops.syncMeta = originalSyncMeta
+	if !errors.Is(err, injected) {
+		t.Fatalf("metadata sync failure returned %v, want injected error", err)
+	}
+	select {
+	case err := <-viewDone:
+		if err != nil {
+			t.Fatalf("reader after metadata sync failure: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("metadata sync failure left readers blocked")
+		t.Fatal("metadata sync failure did not release waiting reader")
 	}
 
 	if err := db.Update(func(tx *Tx) error {
